@@ -1,0 +1,88 @@
+name: Seaport 1.6 source and build export
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Initialize shuttle repository
+        uses: actions/checkout@v4
+
+      - name: Checkout official Seaport 1.6 release with submodules
+        uses: actions/checkout@v4
+        with:
+          repository: ProjectOpenSea/seaport
+          ref: e9c5a9f17cb5ee658ccc9cb1a8eeab02c1f5a4cd
+          path: seaport-release
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout deployment-era unified repository
+        uses: actions/checkout@v4
+        with:
+          repository: ProjectOpenSea/seaport-1.6
+          ref: 4240dc6b30fa73f4b6b437fb588ebe583e796e3a
+          path: seaport-unified
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: nightly
+
+      - name: Record source revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "release=$(git -C seaport-release rev-parse HEAD)"
+            echo "release-submodules:"
+            git -C seaport-release submodule status --recursive || true
+            echo "unified=$(git -C seaport-unified rev-parse HEAD)"
+            echo "unified-submodules:"
+            git -C seaport-unified submodule status --recursive || true
+            echo "forge=$(forge --version | tr '\n' ' ')"
+          } | tee source-revisions.txt
+
+      - name: Build deployment release profiles
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd seaport-release
+          FOUNDRY_PROFILE=reference forge build
+          FOUNDRY_PROFILE=optimized forge build
+
+      - name: Collect source, exact compiler, and build artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p export/compiler
+          cp -a source-revisions.txt export/
+          cp -a seaport-release export/
+          cp -a seaport-unified export/
+          if command -v solc >/dev/null 2>&1; then
+            cp "$(command -v solc)" export/compiler/solc
+          fi
+          find "$HOME/.svm" -type f -name 'solc*0.8.24*' -exec cp {} export/compiler/ \; 2>/dev/null || true
+          tar --exclude='.git' --exclude='node_modules' -czf seaport-1.6-evidence.tar.gz -C export .
+          sha256sum seaport-1.6-evidence.tar.gz | tee seaport-1.6-evidence.tar.gz.sha256
+
+      - name: Upload evidence bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: seaport-1.6-evidence
+          path: |
+            seaport-1.6-evidence.tar.gz
+            seaport-1.6-evidence.tar.gz.sha256
+            source-revisions.txt
+          retention-days: 1
+          if-no-files-found: error
