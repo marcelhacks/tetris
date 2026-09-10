@@ -1,0 +1,120 @@
+name: Firefox JIT effect inventory
+
+on:
+  push:
+    branches:
+      - chatgpt-firefox-audit2-20260910
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Fetch current Firefox JavaScript engine sources
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --depth=1 --filter=blob:none --sparse https://github.com/mozilla-firefox/firefox.git firefox
+          cd firefox
+          git sparse-checkout set js/src
+          git rev-parse HEAD | tee ../firefox-revision.txt
+
+      - name: Inventory restricted call-capable MIR nodes
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          text = Path('firefox/js/src/jit/MIROps.yaml').read_text(encoding='utf-8')
+          starts = list(re.finditer(r'(?m)^- name: ([A-Za-z0-9_]+)\s*$', text))
+          rows = []
+          restricted = []
+          for i, match in enumerate(starts):
+              end = starts[i + 1].start() if i + 1 < len(starts) else len(text)
+              block = text[match.start():end].rstrip()
+              if 'possibly_calls: true' not in block:
+                  continue
+              name = match.group(1)
+              alias_match = re.search(r'(?m)^  alias_set:(?:[^\n]*\n(?:    [^\n]*\n?)*)?', block)
+              alias = alias_match.group(0).strip().replace('\n', ' | ') if alias_match else '<default Any>'
+              movable = 'movable: true' in block
+              guard = 'guard: true' in block
+              rows.append((name, movable, guard, alias))
+              if alias_match and 'load: Any' not in alias and 'store: Any' not in alias:
+                  restricted.append(block)
+          summary = 'name\tmovable\tguard\talias\n' + '\n'.join(
+              '\t'.join(map(str, row)) for row in rows
+          ) + '\n'
+          Path('mir-call-summary.tsv').write_text(summary, encoding='utf-8')
+          Path('mir-restricted-call-blocks.txt').write_text(
+              ('\n\n' + '=' * 80 + '\n\n').join(restricted) + '\n',
+              encoding='utf-8')
+          print(summary)
+          PY
+
+      - name: Search native helpers for hidden script execution
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd firefox
+          {
+            echo '=== Explicit comments about script execution, callbacks, getters, and reentrancy ==='
+            rg -n -i -C 3 \
+              'can run (JavaScript|JS)|may run (JavaScript|JS)|runs? (JavaScript|JS)|arbitrary (JavaScript|JS)|invoke(s|d)? (a )?(getter|setter|callback)|side[- ]effects?|re-?entran|user code|scripted getter|proxy trap' \
+              js/src/jit js/src/wasm js/src/vm js/src/builtin || true
+          } > ../effect-comments.txt
+
+          {
+            echo '=== Property access and coercion from Wasm/JIT implementation code ==='
+            rg -n -C 4 \
+              'JS_GetProperty|GetProperty\(|GetPropertyPure|GetOwnProperty|Call\(|CallGetter|Invoke\(|ToPrimitive|ToString\(|ToNumber\(|IterableToArray|PromiseResolve\(|GetIterator|NewPromiseObject|Debugger' \
+              js/src/wasm js/src/jit || true
+          } > ../jit-wasm-script-entrypoints.txt
+
+          {
+            echo '=== Custom MIR alias/call implementations ==='
+            rg -n -C 5 \
+              'possiblyCalls\(\).*override|getAliasSet\(\).*override|wasmCallAliasSet|AliasSet::(None|Load|Store)' \
+              js/src/jit/MIR* js/src/jit/*MIR* || true
+          } > ../custom-mir-effects.txt
+
+          {
+            echo '=== Builtin module declarations and native entries ==='
+            rg -n -C 4 '^- op:|^  entry:|inline_op:|fail_mode:|uses_memory:' \
+              js/src/wasm/WasmBuiltinModule.yaml || true
+          } > ../wasm-builtin-inventory.txt
+
+          {
+            echo '=== High-risk notes ==='
+            rg -n -i -C 3 'TODO|FIXME|HACK|XXX|unsafe|unchecked|assum(e|ing|ption)' \
+              js/src/wasm js/src/jit | head -n 16000 || true
+          } > ../high-risk-notes.txt
+
+          {
+            echo '=== Native helpers that explicitly enter JS or property lookup ==='
+            rg -n -C 6 \
+              'AutoRealm|CallGetter|CallSetter|Call\(|Invoke\(|JS_GetProperty|GetProperty\(|GetOwnProperty|GetIterator|IterableToArray|PromiseResolve\(' \
+              js/src/wasm js/src/jit | head -n 20000 || true
+          } > ../native-script-entrypoints.txt
+
+      - name: Preserve audit evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: firefox-jit-effect-inventory
+          path: |
+            firefox-revision.txt
+            mir-call-summary.tsv
+            mir-restricted-call-blocks.txt
+            effect-comments.txt
+            jit-wasm-script-entrypoints.txt
+            custom-mir-effects.txt
+            wasm-builtin-inventory.txt
+            high-risk-notes.txt
+            native-script-entrypoints.txt
+          if-no-files-found: warn
