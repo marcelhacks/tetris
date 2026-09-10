@@ -1,0 +1,48 @@
+name: Attest strict Firefox full impact proof
+
+on:
+  workflow_run:
+    workflows: ["Firefox POSIX symlink full impact proof v2"]
+    types: [completed]
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  attest:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: runner-probe-20260910
+      - name: Verify committed strict result
+        run: |
+          python - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          p=Path('.proof-results/posix-symlink-ssh-summary-v2.json')
+          d=json.loads(p.read_text())
+          assert d['verdict']=='CONFIRMED_FULL_CIA_CHAIN'
+          assert d['cvss_candidate']=='CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:H/A:H'
+          assert all(d['conditions'].values())
+          attestation={
+            'source_workflow_run_id':'${{ github.event.workflow_run.id }}',
+            'source_head_sha':'${{ github.event.workflow_run.head_sha }}',
+            'source_conclusion':'${{ github.event.workflow_run.conclusion }}',
+            'verdict':'STRICT_9_6_CONFIRMED',
+            'vector':d['cvss_candidate'],
+            'conditions':d['conditions'],
+            'summary_sha256':hashlib.sha256(p.read_bytes()).hexdigest(),
+          }
+          out=Path('.proof-results/STRICT_9_6_CONFIRMED.json')
+          out.write_text(json.dumps(attestation,indent=2))
+          PY
+      - name: Commit attestation
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add .proof-results/STRICT_9_6_CONFIRMED.json
+          git commit -m 'Attest strict Firefox 9.6 impact chain' || exit 0
+          git push origin HEAD:runner-probe-20260910
