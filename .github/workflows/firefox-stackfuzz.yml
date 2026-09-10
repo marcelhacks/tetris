@@ -1,0 +1,84 @@
+name: Firefox continuation mutation campaign
+
+on:
+  push:
+    branches:
+      - chatgpt-firefox-stackfuzz-20260910
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Fetch current Firefox stack-switching sources and tests
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --depth=1 --filter=blob:none --sparse https://github.com/mozilla-firefox/firefox.git firefox
+          cd firefox
+          git sparse-checkout set \
+            js/src/wasm \
+            js/src/jit \
+            js/src/jit-test/tests/wasm/stack-switching \
+            js/src/jit-test/tests/wasm/js-promise-integration \
+            js/src/jit-test/lib/wasm.js
+          git rev-parse HEAD | tee ../firefox-revision.txt
+          cd ..
+          tar -czf firefox-stack-switching-corpus.tar.gz \
+            firefox/js/src/wasm \
+            firefox/js/src/jit \
+            firefox/js/src/jit-test/tests/wasm/stack-switching \
+            firefox/js/src/jit-test/tests/wasm/js-promise-integration \
+            firefox/js/src/jit-test/lib/wasm.js
+
+      - name: Download official current Mozilla Nightly shell
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE='https://archive.mozilla.org/pub/firefox/nightly/latest-mozilla-central'
+          curl --fail --location --retry 5 --retry-all-errors "$BASE/jsshell-linux-x86_64.zip" -o jsshell.zip
+          unzip -q jsshell.zip -d shell
+          chmod +x shell/js
+          shell/js --version | tee shell-version.txt
+
+      - name: Run upstream high-risk regression baseline
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p baseline-output
+          for test in \
+            bug2042769.js \
+            bug2043042.js \
+            bug2045489.js \
+            bug2061291.js \
+            bug2068355.js \
+            gc-cont-params.js \
+            exceptions-gc.js \
+            cont-result-reg-clobber.js; do
+            set +e
+            timeout 60s shell/js \
+              --wasm-compiler=optimizing \
+              --setpref=wasm_stack_switching \
+              -f firefox/js/src/jit-test/lib/wasm.js \
+              -f "firefox/js/src/jit-test/tests/wasm/stack-switching/$test" \
+              > "baseline-output/$test.log" 2>&1
+            status=$?
+            set -e
+            printf '%s\t%s\n' "$test" "$status" | tee -a baseline-output/status.tsv
+          done
+          cat baseline-output/status.tsv
+
+      - name: Preserve corpus and baseline
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: firefox-continuation-corpus
+          path: |
+            firefox-revision.txt
+            shell-version.txt
+            firefox-stack-switching-corpus.tar.gz
+            baseline-output
+          if-no-files-found: error
