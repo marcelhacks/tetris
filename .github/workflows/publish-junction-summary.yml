@@ -1,0 +1,33 @@
+name: Publish junction-only proof summary
+on:
+  push:
+    branches: [runner-probe-20260910]
+    paths:
+      - .github/workflows/publish-junction-summary.yml
+permissions:
+  actions: read
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: runner-probe-20260910
+      - name: Download sanitized proof artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          rm -rf proof-out
+          mkdir proof-out
+          gh run download 34455592466 --repo "$GITHUB_REPOSITORY" --name sealed-firefox-e2e-windows --dir proof-out
+          test -f proof-out/public-summary.json
+          cp proof-out/public-summary.json junction-only-public-summary.json
+          cat junction-only-public-summary.json
+      - name: Commit sanitized summary
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add junction-only-public-summary.json
+          git commit -m "Publish sanitized junction-only proof summary" || exit 0
+          git push origin HEAD:runner-probe-20260910
