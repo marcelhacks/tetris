@@ -1,0 +1,11 @@
+name: Runner probe
+on:
+  push:
+    branches: [runner-probe-20260910]
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo RUNNER_OK
