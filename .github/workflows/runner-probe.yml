@@ -1,5 +1,6 @@
 name: Ephemeral Firefox runtime verification
 
+# Corrected browser interaction attempt 2.
 on:
   push:
     branches: [runner-probe-20260910]
@@ -164,6 +165,7 @@ jobs:
         shell: pwsh
         env:
           E2E_RESULT_DIR: ${{ github.workspace }}\firefox-e2e-results
+          FIREFOX_BINARY: ${{ steps.setup-firefox.outputs.firefox-path }}
         run: |
           New-Item -ItemType Directory -Force firefox-e2e-results | Out-Null
           python firefox-e2e-proof/run_e2e.py *> firefox-e2e-results\runner-console.txt
