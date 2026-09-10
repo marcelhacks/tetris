@@ -1,0 +1,48 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Firefox controlled reparse relay test</title>
+<style>
+body { font: 16px system-ui; max-width: 900px; margin: 2rem auto; line-height: 1.4 }
+pre { border: 1px solid #999; padding: 1rem; white-space: pre-wrap }
+</style>
+<h1>Firefox controlled reparse relay test</h1>
+<p>Select only the temporary directory supplied by the lab runner.</p>
+<input id="picker" type="file" webkitdirectory>
+<pre id="log">READY</pre>
+<script>
+const input = document.querySelector('#picker');
+const log = document.querySelector('#log');
+window.relayLab = { phase: 'ready', root: null, attempts: [] };
+function emit(value) { log.textContent += '\n' + JSON.stringify(value); }
+input.addEventListener('change', () => {
+  const entries = [...input.webkitEntries];
+  const root = entries.find(e => e.isDirectory) || null;
+  window.relayLab.root = root;
+  window.relayLab.phase = root ? 'selected' : 'no-root';
+  window.relayLab.entries = entries.map(e => ({name:e.name, fullPath:e.fullPath, isDirectory:e.isDirectory}));
+  window.relayLab.fileCount = input.files.length;
+  emit({phase:window.relayLab.phase, entries:window.relayLab.entries, fileCount:input.files.length});
+});
+window.triggerRelayPath = path => new Promise(resolve => {
+  const root = window.relayLab.root;
+  if (!root) {
+    const result = {path, stage:'no-root'};
+    window.relayLab.attempts.push(result); emit(result); resolve(result); return;
+  }
+  window.relayLab.phase = 'triggering';
+  root.getFile(path, {create:false}, entry => {
+    entry.file(async file => {
+      let text = '', readError = null;
+      try { text = await file.text(); } catch (error) { readError = String(error); }
+      const result = {path, stage:'file', name:file.name, size:file.size, text, readError};
+      window.relayLab.attempts.push(result); window.relayLab.phase='done'; emit(result); resolve(result);
+    }, error => {
+      const result = {path, stage:'entry-file-error', error:String(error)};
+      window.relayLab.attempts.push(result); window.relayLab.phase='done'; emit(result); resolve(result);
+    });
+  }, error => {
+    const result = {path, stage:'getFile-error', error:String(error)};
+    window.relayLab.attempts.push(result); window.relayLab.phase='done'; emit(result); resolve(result);
+  });
+});
+</script>
