@@ -1,0 +1,51 @@
+name: Export sparse Firefox security corpus
+
+on:
+  push:
+    branches: [runner-probe-20260910]
+    paths:
+      - .github/workflows/export-firefox-security-corpus.yml
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Sparse checkout Firefox source
+        uses: actions/checkout@v4
+        with:
+          repository: mozilla-firefox/firefox
+          ref: main
+          fetch-depth: 1
+          path: firefox
+          sparse-checkout: |
+            dom/filesystem
+            dom/fs
+            dom/file
+            dom/html
+            dom/ipc
+            dom/webidl
+            xpcom/io
+            widget
+            mobile/android/geckoview
+            mobile/shared/components/geckoview
+            services/fxaccounts
+            services/sync
+            toolkit/components/extensions
+            browser/components/extensions
+            browser/app/profile
+            modules/libpref
+          sparse-checkout-cone-mode: true
+
+      - name: Record revision
+        run: git -C firefox rev-parse HEAD > firefox/REVISION
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firefox-security-corpus
+          path: firefox
+          include-hidden-files: false
+          retention-days: 1
