@@ -1,0 +1,25 @@
+name: Rerun strict Firefox proof for attestation
+
+on:
+  push:
+    branches: [runner-probe-20260910]
+    paths:
+      - .github/workflows/rerun-v2-for-attestation.yml
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  rerun:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Rerun latest v2 proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RUN_ID=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow firefox-posix-symlink-ssh-e2e-v2.yml --branch runner-probe-20260910 --limit 1 --json databaseId --jq '.[0].databaseId')
+          test -n "$RUN_ID"
+          echo "Rerunning $RUN_ID"
+          gh run rerun "$RUN_ID" --repo "$GITHUB_REPOSITORY"
