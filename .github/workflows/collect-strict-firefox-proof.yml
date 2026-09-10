@@ -1,0 +1,119 @@
+name: Collect strict Firefox 9.6 proof
+
+on:
+  push:
+    branches: [runner-probe-20260910]
+    paths:
+      - .github/workflows/collect-strict-firefox-proof.yml
+      - .proof-results/STRICT_9_6_CONFIRMED.json
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: runner-probe-20260910
+      - name: Download independently attested source evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -f .proof-results/STRICT_9_6_CONFIRMED.json
+          RUN_ID=$(python -c 'import json;print(json.load(open(".proof-results/STRICT_9_6_CONFIRMED.json"))["source_workflow_run_id"])')
+          rm -rf collected
+          mkdir collected
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name firefox-posix-symlink-ssh-proof-v2 --dir collected
+          find collected -maxdepth 3 -type f -print
+      - name: Verify and publish fixed proof files
+        run: |
+          python - <<'PY'
+          import hashlib, json, shutil
+          from pathlib import Path
+          out=Path('.proof-results/final-firefox-9.6-proof')
+          out.mkdir(parents=True,exist_ok=True)
+          candidates=list(Path('collected').rglob('result.json'))
+          assert candidates, 'result.json missing'
+          result=json.loads(candidates[0].read_text())
+          assert result.get('verdict')=='CONFIRMED_FULL_CIA_CHAIN', json.dumps(result,indent=2)
+          assert result.get('cvss_candidate')=='CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:H/A:H'
+          assert all((result.get('conditions') or {}).values())
+          sanitized={
+            'verdict':result['verdict'],
+            'cvss_vector':result['cvss_candidate'],
+            'conditions':result['conditions'],
+            'browser_capabilities':result.get('browser_capabilities'),
+            'git_symlink_index':result.get('git_symlink_index'),
+            'root_link_target':result.get('root_link_target'),
+            'selected_root':result.get('selected_root'),
+            'private_key_path':result.get('private_key_path'),
+            'private_key_outside_selected':result.get('private_key_outside_selected'),
+            'resolved_browser_target':result.get('resolved_browser_target'),
+            'expected_key_sha256':result.get('expected_key_sha256'),
+            'browser_exfil_sha256':result.get('browser_exfil_sha256'),
+            'browser_read_exact_private_key':result.get('browser_read_exact_private_key'),
+            'ssh_public_key_auth_succeeded':result.get('ssh_public_key_auth_succeeded'),
+            'remote_confidentiality_read':result.get('remote_confidentiality_read'),
+            'remote_integrity_write':result.get('remote_integrity_write'),
+            'service_pre_attack_status':result.get('service_pre_attack_status'),
+            'remote_availability_guard_deleted':result.get('remote_availability_guard_deleted'),
+            'remote_service_post_attack_unavailable':result.get('remote_service_post_attack_unavailable'),
+            'page_state':result.get('page_state'),
+            'selection_method':result.get('selection_method'),
+            'confirmation_accepted':result.get('confirmation_accepted'),
+          }
+          result_path=out/'result.json'
+          result_path.write_text(json.dumps(sanitized,indent=2,default=str))
+          screenshot=next(iter(Path('collected').rglob('firefox-proof.png')),None)
+          if screenshot:
+            shutil.copy2(screenshot,out/'firefox-proof.png')
+          sshd=next(iter(Path('collected').rglob('sshd.log')),None)
+          if sshd:
+            shutil.copy2(sshd,out/'sshd.log')
+          report=f'''# Firefox selected-directory symlink escape to authenticated code execution
+
+## Independent gate
+
+**Verdict:** `{sanitized['verdict']}`
+
+**CVSS v3.1 candidate:** `{sanitized['cvss_vector']}`
+
+All strict conditions evaluated true:
+
+```json
+{json.dumps(sanitized['conditions'],indent=2)}
+```
+
+## End-to-end sequence
+
+1. The controlled attacker repository stored `root-link` as a Git symlink, mode `120000`, targeting `/`.
+2. A real Firefox instance selected only that repository through `<input type=file webkitdirectory>`.
+3. Page JavaScript called `FileSystemDirectoryEntry.getFile()` through the symlink for an SSH private key physically outside the selected directory.
+4. The page read and POSTed the exact key bytes. Their SHA-256 matched the independently generated outside key.
+5. The exfiltrated key authenticated with OpenSSH to a separate controlled account.
+6. That authenticated session read a protected marker, wrote an integrity marker, deleted an availability guard, and stopped the controlled HTTP service.
+7. The service answered before the attack and was unavailable after it.
+
+## Key evidence
+
+```json
+{json.dumps(sanitized,indent=2,default=str)}
+```
+
+## Integrity
+
+Sanitized result SHA-256: `{hashlib.sha256(result_path.read_bytes()).hexdigest()}`
+'''
+          (out/'REPORT.md').write_text(report)
+          PY
+      - name: Commit fixed proof paths
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add .proof-results/final-firefox-9.6-proof
+          git commit -m 'Publish independently gated Firefox 9.6 proof' || exit 0
+          git push origin HEAD:runner-probe-20260910
