@@ -1,0 +1,180 @@
+name: Firefox homepage principal probe
+
+on:
+  push:
+    branches: [runner-probe-20260910]
+    paths:
+      - .github/workflows/firefox-homepage-principal-probe.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: browser-actions/setup-firefox@v1
+        id: firefox
+        with:
+          firefox-version: latest
+
+      - uses: browser-actions/setup-geckodriver@latest
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - run: python -m pip install --disable-pip-version-check selenium
+
+      - name: Run safe principal probe
+        env:
+          FIREFOX_BINARY: ${{ steps.firefox.outputs.firefox-path }}
+        run: |
+          cat > probe.py <<'PY'
+          import json
+          import os
+          import time
+          from pathlib import Path
+          from selenium import webdriver
+          from selenium.webdriver.firefox.options import Options
+          from selenium.webdriver.firefox.service import Service
+
+          out = Path("probe-results")
+          out.mkdir(exist_ok=True)
+          options = Options()
+          options.binary_location = os.environ["FIREFOX_BINARY"]
+          options.add_argument("-headless")
+          options.add_argument("-remote-allow-system-access")
+          options.set_preference("browser.shell.checkDefaultBrowser", False)
+          options.set_preference("browser.aboutwelcome.enabled", False)
+          options.set_preference("datareporting.policy.dataSubmissionEnabled", False)
+          options.set_preference("browser.startup.page", 0)
+          options.set_preference("security.probe.homepage_privileged", False)
+
+          service = Service(log_output=str(out / "geckodriver.log"), service_args=["--log", "trace"])
+          driver = webdriver.Firefox(options=options, service=service)
+          result = {"capabilities": driver.capabilities, "probes": []}
+          try:
+              driver.get("about:blank")
+              driver.set_context("chrome")
+              payload = """javascript:(()=>{let r={ran:true,components:typeof Components,chromeUtils:typeof ChromeUtils,services:typeof Services};try{Services.prefs.setBoolPref('security.probe.homepage_privileged',true);r.prefWrite=true}catch(e){r.prefWrite=false;r.error=String(e)}document.documentElement.innerHTML='<head><title>JS_HOME_PROBE</title></head><body><pre id=probe>'+JSON.stringify(r)+'</pre></body>';void 0})()"""
+
+              chrome_before = driver.execute_script("""
+                const b = window.gBrowser.selectedBrowser;
+                Services.prefs.setStringPref('browser.startup.homepage', arguments[0]);
+                Services.prefs.setIntPref('browser.startup.page', 1);
+                return {
+                  currentURI: b.currentURI.spec,
+                  principal: b.contentPrincipal?.origin,
+                  isSystem: !!b.contentPrincipal?.isSystemPrincipal,
+                  homepage: Services.prefs.getStringPref('browser.startup.homepage'),
+                  prefMarker: Services.prefs.getBoolPref('security.probe.homepage_privileged', false)
+                };
+              """, payload)
+
+              call_result = driver.execute_script("""
+                try {
+                  window.loadOneOrMoreURIs(arguments[0]);
+                  return {called: true};
+                } catch (e) {
+                  return {called: false, error: String(e), stack: e.stack};
+                }
+              """, payload)
+              time.sleep(3)
+
+              chrome_after = driver.execute_script("""
+                const b = window.gBrowser.selectedBrowser;
+                return {
+                  currentURI: b.currentURI.spec,
+                  principal: b.contentPrincipal?.origin,
+                  isSystem: !!b.contentPrincipal?.isSystemPrincipal,
+                  prefMarker: Services.prefs.getBoolPref('security.probe.homepage_privileged', false),
+                  title: b.contentTitle
+                };
+              """)
+              driver.set_context("content")
+              content = driver.execute_script("""
+                return {
+                  href: location.href,
+                  title: document.title,
+                  text: document.body?.innerText || '',
+                  components: typeof Components,
+                  chromeUtils: typeof ChromeUtils,
+                  services: typeof Services
+                };
+              """)
+              result["probes"].append({
+                "name": "loadOneOrMoreURIs-default-principal",
+                "chrome_before": chrome_before,
+                "call": call_result,
+                "chrome_after": chrome_after,
+                "content": content,
+              })
+
+              # Control: explicitly load the same javascript URI in the selected browser.
+              driver.set_context("chrome")
+              explicit = driver.execute_script("""
+                const b = window.gBrowser.selectedBrowser;
+                try {
+                  b.loadURI(arguments[0], {
+                    triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal()
+                  });
+                  return {called: true};
+                } catch (e) {
+                  return {called: false, error: String(e), stack: e.stack};
+                }
+              """, payload)
+              time.sleep(3)
+              chrome_control = driver.execute_script("""
+                const b = window.gBrowser.selectedBrowser;
+                return {
+                  currentURI: b.currentURI.spec,
+                  principal: b.contentPrincipal?.origin,
+                  isSystem: !!b.contentPrincipal?.isSystemPrincipal,
+                  prefMarker: Services.prefs.getBoolPref('security.probe.homepage_privileged', false),
+                  title: b.contentTitle
+                };
+              """)
+              driver.set_context("content")
+              content_control = driver.execute_script("""
+                return {href: location.href, title: document.title, text: document.body?.innerText || ''};
+              """)
+              result["probes"].append({
+                "name": "browser-loadURI-explicit-system-principal",
+                "call": explicit,
+                "chrome_after": chrome_control,
+                "content": content_control,
+              })
+          except Exception as exc:
+              import traceback
+              result["error"] = repr(exc)
+              result["traceback"] = traceback.format_exc()
+          finally:
+              try:
+                  driver.set_context("chrome")
+                  result["finalPrefMarker"] = driver.execute_script(
+                    "return Services.prefs.getBoolPref('security.probe.homepage_privileged', false)"
+                  )
+              except Exception as exc:
+                  result["finalPrefError"] = repr(exc)
+              try:
+                  driver.save_screenshot(str(out / "result.png"))
+              except Exception as exc:
+                  result["screenshotError"] = repr(exc)
+              driver.quit()
+
+          (out / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+          print(json.dumps(result, indent=2))
+          PY
+          python probe.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firefox-homepage-principal-probe
+          path: probe-results
+          retention-days: 1
