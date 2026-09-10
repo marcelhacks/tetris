@@ -24,7 +24,7 @@ jobs:
             js/src/jit \
             js/src/jit-test/tests/wasm/stack-switching \
             js/src/jit-test/tests/wasm/js-promise-integration \
-            js/src/jit-test/lib/wasm.js
+            js/src/jit-test/lib
           git rev-parse HEAD | tee ../firefox-revision.txt
           cd ..
           tar -czf firefox-stack-switching-corpus.tar.gz \
@@ -32,7 +32,7 @@ jobs:
             firefox/js/src/jit \
             firefox/js/src/jit-test/tests/wasm/stack-switching \
             firefox/js/src/jit-test/tests/wasm/js-promise-integration \
-            firefox/js/src/jit-test/lib/wasm.js
+            firefox/js/src/jit-test/lib
 
       - name: Download official current Mozilla Nightly shell
         shell: bash
