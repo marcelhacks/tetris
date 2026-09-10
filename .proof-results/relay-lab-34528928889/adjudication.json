@@ -1,0 +1,35 @@
+{
+  "run_id": "34528928889",
+  "verdict": "NOT_CONFIRMED",
+  "cvss_vector_if_environment_is_relay_compatible": null,
+  "cvss_base_score_if_environment_is_relay_compatible": null,
+  "conditions": {
+    "same_run_nonce": false,
+    "anonymous_control_rejected": false,
+    "anonymous_control_no_action": true,
+    "ntlm_principal_is_lab_victim": false,
+    "relay_attack_received_success": false,
+    "authenticated_integrity_write": false,
+    "authenticated_availability_delete": false,
+    "authenticated_command_execution": false,
+    "firefox_real_browser_started": false,
+    "native_folder_picker_completed": false,
+    "reparse_link_created": false,
+    "firefox_api_triggered": false,
+    "firefox_process_attribution": false,
+    "netonly_process_launched": false
+  },
+  "principal": "",
+  "browser": null,
+  "firefox_parent_pid": null,
+  "trigger_attempts": [],
+  "procmon_firefox_events": [],
+  "smb_proxy_events": [],
+  "proof": {},
+  "http_attack": {},
+  "source_files": {
+    "attacker": null,
+    "victim": null,
+    "launcher": null
+  }
+}
