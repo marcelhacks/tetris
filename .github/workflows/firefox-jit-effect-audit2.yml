@@ -1,4 +1,4 @@
-name: Firefox JIT effect inventory
+name: Firefox JIT unsafe ABI audit
 
 on:
   push:
@@ -11,7 +11,7 @@ permissions:
 jobs:
   audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - name: Fetch current Firefox JavaScript engine sources
         shell: bash
@@ -22,42 +22,7 @@ jobs:
           git sparse-checkout set js/src
           git rev-parse HEAD | tee ../firefox-revision.txt
 
-      - name: Inventory restricted call-capable MIR nodes
-        shell: bash
-        run: |
-          set -euxo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-
-          text = Path('firefox/js/src/jit/MIROps.yaml').read_text(encoding='utf-8')
-          starts = list(re.finditer(r'(?m)^- name: ([A-Za-z0-9_]+)\s*$', text))
-          rows = []
-          restricted = []
-          for i, match in enumerate(starts):
-              end = starts[i + 1].start() if i + 1 < len(starts) else len(text)
-              block = text[match.start():end].rstrip()
-              if 'possibly_calls: true' not in block:
-                  continue
-              name = match.group(1)
-              alias_match = re.search(r'(?m)^  alias_set:(?:[^\n]*\n(?:    [^\n]*\n?)*)?', block)
-              alias = alias_match.group(0).strip().replace('\n', ' | ') if alias_match else '<default Any>'
-              movable = 'movable: true' in block
-              guard = 'guard: true' in block
-              rows.append((name, movable, guard, alias))
-              if alias_match and 'load: Any' not in alias and 'store: Any' not in alias:
-                  restricted.append(block)
-          summary = 'name\tmovable\tguard\talias\n' + '\n'.join(
-              '\t'.join(map(str, row)) for row in rows
-          ) + '\n'
-          Path('mir-call-summary.tsv').write_text(summary, encoding='utf-8')
-          Path('mir-restricted-call-blocks.txt').write_text(
-              ('\n\n' + '=' * 80 + '\n\n').join(restricted) + '\n',
-              encoding='utf-8')
-          print(summary)
-          PY
-
-      - name: Search native helpers for hidden script execution
+      - name: Analyze unsafe ABI and hidden script-entry paths
         shell: bash
         run: |
           set -euxo pipefail
@@ -66,85 +31,202 @@ jobs:
           import re
 
           root = Path('firefox/js/src')
-          allowed = {'.cpp', '.h', '.inl', '.yaml', '.py', '.js', '.msg'}
-          files = [p for p in root.rglob('*') if p.is_file() and (p.suffix in allowed or p.name.endswith('-inl.h'))]
+          suffixes = {'.cpp', '.h', '.inl'}
+          files = [p for p in root.rglob('*') if p.is_file() and
+                   (p.suffix in suffixes or p.name.endswith('-inl.h'))]
 
-          groups = {
-              'effect-comments.txt': (
-                  re.compile(r'can run (?:JavaScript|JS)|may run (?:JavaScript|JS)|runs? (?:JavaScript|JS)|arbitrary (?:JavaScript|JS)|invoke(?:s|d)? (?:a )?(?:getter|setter|callback)|side[- ]effects?|re-?entran|user code|scripted getter|proxy trap', re.I),
-                  ('jit/', 'wasm/', 'vm/', 'builtin/'), 3, 16000),
-              'jit-wasm-script-entrypoints.txt': (
-                  re.compile(r'JS_GetProperty|GetProperty\(|GetPropertyPure|GetOwnProperty|Call\(|CallGetter|Invoke\(|ToPrimitive|ToString\(|ToNumber\(|IterableToArray|PromiseResolve\(|GetIterator|NewPromiseObject|Debugger'),
-                  ('jit/', 'wasm/'), 4, 22000),
-              'custom-mir-effects.txt': (
-                  re.compile(r'possiblyCalls\(.*override|getAliasSet\(.*override|wasmCallAliasSet|AliasSet::(?:None|Load|Store)'),
-                  ('jit/',), 5, 22000),
-              'high-risk-notes.txt': (
-                  re.compile(r'TODO|FIXME|HACK|XXX|unsafe|unchecked|assum(?:e|ing|ption)', re.I),
-                  ('jit/', 'wasm/'), 3, 18000),
-              'native-script-entrypoints.txt': (
-                  re.compile(r'AutoRealm|CallGetter|CallSetter|Call\(|Invoke\(|JS_GetProperty|GetProperty\(|GetOwnProperty|GetIterator|IterableToArray|PromiseResolve\('),
-                  ('jit/', 'wasm/'), 6, 24000),
-          }
+          danger_re = re.compile(
+              r'\b(?:Call|Invoke|GetProperty|GetOwnProperty|GetElement|HasProperty|'
+              r'LookupProperty|PromiseResolve|NewPromiseObject|IterableToArray|'
+              r'GetIterator|ToPrimitive|ToString|ToNumber|JS_CallFunction|'
+              r'JS_GetProperty|CallGetter|CallSetter|RunJobs|DrainJobQueue)\b')
+          unsafe_re = re.compile(r'\bAutoUnsafeCallWithABI\b')
 
-          def scan(pattern, prefixes, context, cap):
-              out = []
-              count = 0
-              for path in files:
-                  rel = path.relative_to(root).as_posix()
-                  if not any(rel.startswith(prefix) for prefix in prefixes):
+          def function_span(lines, hit):
+              # Find a plausible function opening brace before the hit.
+              start = hit
+              while start >= 0:
+                  line = lines[start]
+                  if '{' in line and not line.lstrip().startswith(('#', '//')):
+                      prefix = '\n'.join(lines[max(0, start-8):start+1])
+                      if re.search(r'[\w:~<>*&]\s+[\w:~<>]+\s*\([^;]*\)\s*(?:const\s*)?\{\s*$', prefix, re.S):
+                          break
+                  start -= 1
+              if start < 0:
+                  return max(0, hit-10), min(len(lines), hit+20)
+              depth = 0
+              seen = False
+              end = start
+              while end < len(lines):
+                  for ch in lines[end]:
+                      if ch == '{':
+                          depth += 1; seen = True
+                      elif ch == '}':
+                          depth -= 1
+                  end += 1
+                  if seen and depth <= 0:
+                      break
+              return max(0, start-8), min(len(lines), end+2)
+
+          unsafe_out = []
+          unsafe_names = set()
+          for path in files:
+              text = path.read_text(encoding='utf-8', errors='replace')
+              if 'AutoUnsafeCallWithABI' not in text:
+                  continue
+              lines = text.splitlines()
+              hits = [i for i, line in enumerate(lines) if unsafe_re.search(line)]
+              spans = []
+              for hit in hits:
+                  lo, hi = function_span(lines, hit)
+                  if not spans or lo > spans[-1][1]:
+                      spans.append([lo, hi])
+                  else:
+                      spans[-1][1] = max(spans[-1][1], hi)
+              rel = path.relative_to(root).as_posix()
+              for lo, hi in spans:
+                  body = '\n'.join(lines[lo:hi])
+                  signature = next((lines[i].strip() for i in range(lo, min(hi, lo+12))
+                                    if '(' in lines[i] and not lines[i].lstrip().startswith('//')), '<unknown>')
+                  names = re.findall(r'([A-Za-z_][A-Za-z0-9_:~]*)\s*\(', signature)
+                  if names:
+                      unsafe_names.add(names[-1].split('::')[-1])
+                  dangers = sorted(set(danger_re.findall(body)))
+                  unsafe_out.append(f'===== {rel}:{lo+1}-{hi} =====')
+                  unsafe_out.append(f'DANGEROUS_TOKENS={dangers}')
+                  unsafe_out.extend(f'{n+1}: {lines[n]}' for n in range(lo, hi))
+                  unsafe_out.append('')
+          Path('unsafe-abi-functions.txt').write_text('\n'.join(unsafe_out), encoding='utf-8')
+
+          # Collect direct ABI call targets from JIT and Wasm code.
+          target_re = re.compile(r'callWithABI(?:<[^>]*,\s*([A-Za-z_][A-Za-z0-9_:]*)(?:\(\))?>|\s*\(\s*(?:DynamicFunction<[^>]+>\()?([A-Za-z_][A-Za-z0-9_:]*))')
+          rows = []
+          for path in files:
+              rel = path.relative_to(root).as_posix()
+              if not (rel.startswith('jit/') or rel.startswith('wasm/')):
+                  continue
+              lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
+              for i, line in enumerate(lines):
+                  if 'callWithABI' not in line:
                       continue
-                  try:
-                      lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
-                  except OSError:
-                      continue
-                  hits = [i for i, line in enumerate(lines) if pattern.search(line)]
-                  if not hits:
-                      continue
-                  merged = []
-                  for i in hits:
-                      lo, hi = max(0, i-context), min(len(lines), i+context+1)
-                      if merged and lo <= merged[-1][1]:
-                          merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
-                      else:
-                          merged.append((lo, hi))
-                  for lo, hi in merged:
-                      out.append(f'===== {rel}:{lo+1}-{hi} =====')
-                      for n in range(lo, hi):
-                          out.append(f'{n+1}: {lines[n]}')
-                          count += 1
-                          if count >= cap:
-                              out.append('=== OUTPUT CAPPED ===')
-                              return '\n'.join(out) + '\n'
-                      out.append('')
-              return '\n'.join(out) + '\n'
+                  window = ' '.join(lines[i:min(len(lines), i+6)])
+                  for match in target_re.finditer(window):
+                      target = match.group(1) or match.group(2)
+                      if target:
+                          rows.append((rel, i+1, target))
+          Path('abi-call-targets.tsv').write_text(
+              'file\tline\ttarget\n' + '\n'.join(f'{a}\t{b}\t{c}' for a,b,c in rows) + '\n',
+              encoding='utf-8')
 
-          for name, spec in groups.items():
-              Path(name).write_text(scan(*spec), encoding='utf-8')
+          # Find likely function definitions and print any ABI target whose body
+          # contains a script-entry/property/coercion token.
+          targets = {t.split('::')[-1] for _,_,t in rows}
+          report = []
+          for path in files:
+              lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
+              rel = path.relative_to(root).as_posix()
+              for i, line in enumerate(lines):
+                  for target in targets:
+                      if target not in line or '(' not in line or line.lstrip().startswith(('#','//')):
+                          continue
+                      if re.search(r'\b' + re.escape(target) + r'\s*\(', line) is None:
+                          continue
+                      lo, hi = function_span(lines, i)
+                      body = '\n'.join(lines[lo:hi])
+                      dangers = sorted(set(danger_re.findall(body)))
+                      if not dangers:
+                          continue
+                      report.append(f'===== target={target} {rel}:{lo+1}-{hi} =====')
+                      report.append(f'DANGEROUS_TOKENS={dangers}')
+                      report.extend(f'{n+1}: {lines[n]}' for n in range(lo, hi))
+                      report.append('')
+          Path('abi-target-danger-bodies.txt').write_text('\n'.join(report), encoding='utf-8')
 
-          builtin = Path('firefox/js/src/wasm/WasmBuiltinModule.yaml').read_text(encoding='utf-8', errors='replace').splitlines()
-          selected = []
-          for i, line in enumerate(builtin):
-              if re.search(r'^- op:|^  entry:|inline_op:|fail_mode:|uses_memory:', line):
-                  lo, hi = max(0, i-4), min(len(builtin), i+5)
-                  selected.extend(f'{n+1}: {builtin[n]}' for n in range(lo, hi))
-                  selected.append('')
-          Path('wasm-builtin-inventory.txt').write_text('\n'.join(selected), encoding='utf-8')
+          # Focused extracts for Wasm stack switching, exception wrapping, and
+          # calls that can enter script or allocate.
+          focus_patterns = [
+              re.compile(p, re.I) for p in [
+                  r'GetOrWrapWasmException', r'WasmExceptionObject', r'WasmFindHandler',
+                  r'MWasmResume', r'MWasmSuspend', r'ContBaseFrame', r'PromiseResolve',
+                  r'AddPromiseReactions', r'GetPromiseResults', r'AutoUnsafeCallWithABI',
+                  r'GetProperty\(', r'Call\(', r'Invoke\(', r'IterableToArray',
+                  r'can run (?:JS|JavaScript)', r're-?entran', r'side[- ]effect',
+              ]
+          ]
+          focus = []
+          for path in files:
+              rel = path.relative_to(root).as_posix()
+              if not (rel.startswith('wasm/') or rel.startswith('jit/')):
+                  continue
+              lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
+              hits = [i for i,l in enumerate(lines) if any(p.search(l) for p in focus_patterns)]
+              merged = []
+              for i in hits:
+                  lo, hi = max(0, i-8), min(len(lines), i+10)
+                  if merged and lo <= merged[-1][1]:
+                      merged[-1][1] = max(merged[-1][1], hi)
+                  else:
+                      merged.append([lo,hi])
+              for lo,hi in merged:
+                  focus.append(f'===== {rel}:{lo+1}-{hi} =====')
+                  focus.extend(f'{n+1}: {lines[n]}' for n in range(lo,hi))
+                  focus.append('')
+          Path('wasm-jit-focused-extracts.txt').write_text('\n'.join(focus), encoding='utf-8')
           PY
 
-      - name: Preserve audit evidence
+      - name: Bundle exact high-risk sources
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p source-bundle
+          while read -r file; do
+            if [ -f "firefox/js/src/$file" ]; then
+              mkdir -p "source-bundle/$(dirname "$file")"
+              cp "firefox/js/src/$file" "source-bundle/$file"
+            fi
+          done <<'FILES'
+          jit/MIR.h
+          jit/MIR.cpp
+          jit/MIR-wasm.h
+          jit/MIR-wasm.cpp
+          jit/MIROps.yaml
+          jit/AliasAnalysis.cpp
+          jit/LICM.cpp
+          jit/Lowering.cpp
+          jit/CodeGenerator.cpp
+          jit/CacheIR.cpp
+          jit/CacheIRCompiler.cpp
+          jit/VMFunctions.cpp
+          jit/ABIFunctionList-inl.h
+          jit/LIR.h
+          jit/LIR.cpp
+          vm/ObjectOperations-inl.h
+          vm/TypedArrayObject-inl.h
+          vm/TypedArrayObject.cpp
+          wasm/WasmPI.cpp
+          wasm/WasmBuiltins.cpp
+          wasm/WasmFrameIter.cpp
+          wasm/WasmStacks.cpp
+          wasm/WasmStubs.cpp
+          wasm/WasmIonCompile.cpp
+          wasm/WasmBaselineCompile.cpp
+          wasm/WasmJS.cpp
+          wasm/WasmJS.h
+          wasm/WasmGcObject.cpp
+          wasm/WasmGC.cpp
+          FILES
+          tar -czf source-bundle.tar.gz source-bundle
+
+      - name: Preserve evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: firefox-jit-effect-inventory
+          name: firefox-unsafe-abi-audit
           path: |
             firefox-revision.txt
-            mir-call-summary.tsv
-            mir-restricted-call-blocks.txt
-            effect-comments.txt
-            jit-wasm-script-entrypoints.txt
-            custom-mir-effects.txt
-            wasm-builtin-inventory.txt
-            high-risk-notes.txt
-            native-script-entrypoints.txt
+            unsafe-abi-functions.txt
+            abi-call-targets.tsv
+            abi-target-danger-bodies.txt
+            wasm-jit-focused-extracts.txt
+            source-bundle.tar.gz
           if-no-files-found: warn
