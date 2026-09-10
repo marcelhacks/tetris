@@ -1,0 +1,47 @@
+name: Publish strict Firefox proof release
+
+on:
+  push:
+    branches: [runner-probe-20260910]
+    paths:
+      - .github/workflows/publish-strict-firefox-proof-release.yml
+      - .proof-results/final-firefox-9.6-proof/**
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: runner-probe-20260910
+          fetch-depth: 0
+      - name: Verify strict evidence
+        run: |
+          set -euo pipefail
+          test -f .proof-results/final-firefox-9.6-proof/result.json
+          python - <<'PY'
+          import json
+          d=json.load(open('.proof-results/final-firefox-9.6-proof/result.json'))
+          assert d['verdict']=='CONFIRMED_FULL_CIA_CHAIN'
+          assert d['cvss_vector']=='CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:H/A:H'
+          assert all(d['conditions'].values())
+          PY
+      - name: Package proof
+        run: |
+          python - <<'PY'
+          import zipfile
+          from pathlib import Path
+          root=Path('.proof-results/final-firefox-9.6-proof')
+          with zipfile.ZipFile('firefox-strict-9.6-proof.zip','w',zipfile.ZIP_DEFLATED) as z:
+            for p in sorted(root.rglob('*')):
+              if p.is_file(): z.write(p,p.relative_to(root.parent))
+          PY
+      - name: Create fixed release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete firefox-strict-proof-20260910 --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create firefox-strict-proof-20260910 firefox-strict-9.6-proof.zip --repo "$GITHUB_REPOSITORY" --title 'Firefox strict 9.6 proof' --notes 'Independently gated controlled lab evidence. No secret key material is included.'
