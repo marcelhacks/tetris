@@ -1,0 +1,95 @@
+name: Orchestrate strict Firefox proof publication
+
+on:
+  push:
+    branches: [runner-probe-20260910]
+    paths:
+      - .github/workflows/orchestrate-strict-firefox-proof.yml
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  orchestrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: runner-probe-20260910
+          fetch-depth: 0
+      - name: Wait for independent attestation
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 90); do
+            git pull --ff-only origin runner-probe-20260910 || true
+            if test -f .proof-results/STRICT_9_6_CONFIRMED.json; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo 'Strict attestation was not produced.' >&2
+          exit 1
+      - name: Download source evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RUN_ID=$(python -c 'import json;print(json.load(open(".proof-results/STRICT_9_6_CONFIRMED.json"))["source_workflow_run_id"])')
+          rm -rf collected
+          mkdir collected
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name firefox-posix-symlink-ssh-proof-v2 --dir collected
+      - name: Verify and package
+        run: |
+          python - <<'PY'
+          import hashlib,json,shutil,zipfile
+          from pathlib import Path
+          srcs=list(Path('collected').rglob('result.json'))
+          assert srcs
+          d=json.loads(srcs[0].read_text())
+          assert d.get('verdict')=='CONFIRMED_FULL_CIA_CHAIN',json.dumps(d,indent=2)
+          assert d.get('cvss_candidate')=='CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:H/A:H'
+          assert all(d.get('conditions',{}).values())
+          assert d.get('expected_key_sha256')==d.get('browser_exfil_sha256')
+          out=Path('.proof-results/final-firefox-9.6-proof')
+          out.mkdir(parents=True,exist_ok=True)
+          keep=['verdict','cvss_candidate','conditions','browser_capabilities','git_symlink_index','root_link_target','selected_root','private_key_path','private_key_outside_selected','resolved_browser_target','expected_key_sha256','browser_exfil_sha256','browser_read_exact_private_key','ssh_public_key_auth_succeeded','remote_confidentiality_read','remote_integrity_write','service_pre_attack_status','remote_availability_guard_deleted','remote_service_post_attack_unavailable','page_state','selection_method','confirmation_accepted']
+          s={k:d.get(k) for k in keep}
+          (out/'result.json').write_text(json.dumps(s,indent=2,default=str))
+          for name in ('firefox-proof.png','sshd.log'):
+            p=next(iter(Path('collected').rglob(name)),None)
+            if p: shutil.copy2(p,out/name)
+          report=f'''# Firefox selected-directory symlink escape to authenticated code execution
+
+Verdict: {d['verdict']}
+
+Vector: {d['cvss_candidate']}
+
+The real Firefox browser read the exact SSH private key outside the selected attacker repository through a Git symlink to `/`. The key hash received by the web origin matched the independently generated key. That key then authenticated to the isolated OpenSSH subsequent system, read protected data, wrote an integrity marker, deleted the availability guard, and stopped the controlled service.
+
+Conditions:
+
+```json
+{json.dumps(d['conditions'],indent=2)}
+```
+
+Sanitized result SHA-256: {hashlib.sha256((out/'result.json').read_bytes()).hexdigest()}
+'''
+          (out/'REPORT.md').write_text(report)
+          with zipfile.ZipFile('firefox-strict-9.6-proof.zip','w',zipfile.ZIP_DEFLATED) as z:
+            for p in sorted(out.rglob('*')):
+              if p.is_file():z.write(p,p.relative_to(out.parent))
+          PY
+      - name: Commit and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add .proof-results/final-firefox-9.6-proof
+          git commit -m 'Publish strict Firefox 9.6 proof' || true
+          git push origin HEAD:runner-probe-20260910 || true
+          gh release delete firefox-strict-proof-20260910 --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create firefox-strict-proof-20260910 firefox-strict-9.6-proof.zip --repo "$GITHUB_REPOSITORY" --title 'Firefox strict 9.6 proof' --notes 'Controlled end-to-end evidence; no private key material is included.'
