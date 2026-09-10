@@ -9,3 +9,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: echo RUNNER_OK
+      - name: Probe private repository access without printing data
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            https://api.github.com/repos/marcelhacks/webb22_alm_cicd)
+          echo "PRIVATE_REPO_HTTP=$code"
