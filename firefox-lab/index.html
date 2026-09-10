@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Firefox parent boundary test</title>
+<input id="picker" type="file" webkitdirectory>
+<pre id="log">READY</pre>
+<script>
+const input = document.querySelector('#picker');
+const log = document.querySelector('#log');
+window.lab = {phase:'ready', root:null, attempts:[]};
+function out(v){ log.textContent += '\n' + JSON.stringify(v); }
+input.addEventListener('change', () => {
+  const entries = [...input.webkitEntries];
+  const root = entries.find(e => e.isDirectory) || null;
+  window.lab.root = root;
+  window.lab.phase = root ? 'selected' : 'no-root';
+  window.lab.entries = entries.map(e => ({name:e.name, fullPath:e.fullPath, isDirectory:e.isDirectory}));
+  out({phase:window.lab.phase, entries:window.lab.entries});
+});
+window.triggerPath = path => new Promise(resolve => {
+  const root = window.lab.root;
+  if (!root) { const r={path,stage:'no-root'}; window.lab.attempts.push(r); resolve(r); return; }
+  window.lab.phase='triggering';
+  root.getFile(path, {create:false}, entry => {
+    entry.file(async file => {
+      let text='', readError=null;
+      try { text = await file.text(); } catch (e) { readError=String(e); }
+      const r={path,stage:'file',name:file.name,size:file.size,text,readError};
+      window.lab.attempts.push(r); window.lab.phase='done'; out(r); resolve(r);
+    }, e => { const r={path,stage:'entry.file-error',error:String(e)}; window.lab.attempts.push(r); window.lab.phase='done'; out(r); resolve(r); });
+  }, e => { const r={path,stage:'getFile-error',error:String(e)}; window.lab.attempts.push(r); window.lab.phase='done'; out(r); resolve(r); });
+});
+</script>
