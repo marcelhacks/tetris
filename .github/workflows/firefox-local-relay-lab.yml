@@ -1,0 +1,131 @@
+name: Firefox deterministic local relay lab
+
+on:
+  push:
+    branches: [runner-probe-20260910]
+    paths:
+      - .github/workflows/firefox-local-relay-lab.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  LAB_NONCE: ${{ github.run_id }}
+
+jobs:
+  prove:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: runner-probe-20260910
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up latest Firefox
+        id: setup-firefox
+        uses: browser-actions/setup-firefox@v1
+        with:
+          firefox-version: latest
+
+      - name: Set up geckodriver
+        uses: browser-actions/setup-geckodriver@latest
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install isolated lab dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check impacket pyspnego requests selenium pywinauto psutil
+
+      - name: Configure loopback transport for remote-protocol simulation
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force local-relay-out | Out-Null
+          $state = [ordered]@{}
+          foreach ($service in @('LanmanServer','W3SVC','WebClient')) {
+            try {
+              Stop-Service $service -Force -ErrorAction Stop
+              $state["stopped_$service"] = $true
+            } catch {
+              $state["stopped_$service"] = $false
+              $state["error_$service"] = $_.Exception.Message
+            }
+          }
+          try {
+            New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name DisableLoopbackCheck -PropertyType DWord -Value 1 -Force | Out-Null
+            $state.disableLoopbackCheck = $true
+          } catch {
+            $state.disableLoopbackCheck = $false
+            $state.disableLoopbackError = $_.Exception.Message
+          }
+          $hosts = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
+          Add-Content -Encoding ASCII $hosts "`n127.77.77.77 ffrelay-lab"
+          $state.hostsEntry = '127.77.77.77 ffrelay-lab'
+          $state | ConvertTo-Json -Depth 6 | Set-Content -Encoding UTF8 local-relay-out/windows-state.json
+
+      - name: Execute complete Firefox to authenticated-command chain
+        shell: pwsh
+        env:
+          FIREFOX_BINARY: ${{ steps.setup-firefox.outputs.firefox-path }}
+          LAB_OUT: ${{ github.workspace }}\local-relay-out
+        run: |
+          python firefox-relay-lab/local_orchestrator.py *> local-relay-out\console.txt
+          $code = $LASTEXITCODE
+          Set-Content -Encoding ASCII local-relay-out\runner-exit.txt $code
+          Write-Host "ORCHESTRATOR_EXIT=$code"
+          exit 0
+
+      - name: Publish strict machine verdict
+        if: always()
+        shell: pwsh
+        run: |
+          @'
+          import json, os
+          from pathlib import Path
+          out=Path('local-relay-out')
+          source=out/'local-orchestrator-result.json'
+          data=json.loads(source.read_text(encoding='utf-8-sig')) if source.exists() else {'verdict':'NO_RESULT'}
+          summary={
+            'run_id':os.environ['GITHUB_RUN_ID'],
+            'verdict':data.get('verdict'),
+            'conditions':data.get('conditions'),
+            'browser':((data.get('victim') or {}).get('capabilities') or {}).get('browserVersion'),
+            'principal':(data.get('target_proof') or {}).get('principal'),
+            'error':data.get('error'),
+          }
+          (out/'public-summary.json').write_text(json.dumps(summary,indent=2))
+          proof=Path('.proof-results')/f"local-relay-{os.environ['GITHUB_RUN_ID']}"
+          proof.mkdir(parents=True,exist_ok=True)
+          (proof/'summary.json').write_text(json.dumps(summary,indent=2))
+          matches=list(out.glob('CONFIRMED_9_6_*.json'))
+          if matches:
+            Path('.proof-results/CONFIRMED_9_6.json').write_bytes(matches[0].read_bytes())
+          print(json.dumps(summary,indent=2))
+          '@ | Set-Content -Encoding UTF8 local-relay-out/summarize.py
+          python local-relay-out/summarize.py
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add .proof-results
+          git commit -m "Publish deterministic Firefox relay verdict ${{ github.run_id }}" || exit 0
+          for ($n=1; $n -le 5; $n++) {
+            git pull --rebase origin runner-probe-20260910
+            git push origin HEAD:runner-probe-20260910
+            if ($LASTEXITCODE -eq 0) { break }
+            Start-Sleep -Seconds (2*$n)
+          }
+
+      - name: Upload complete lab evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: firefox-local-relay-${{ github.run_id }}
+          path: local-relay-out
+          if-no-files-found: warn
+          retention-days: 1
