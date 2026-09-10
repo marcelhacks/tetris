@@ -1,11 +1,12 @@
 name: Ephemeral Firefox runtime verification
 
-# Corrected browser interaction attempt 2.
+# Corrected browser interaction attempt 3.
 on:
   push:
     branches: [runner-probe-20260910]
     paths:
       - .github/workflows/runner-probe.yml
+      - .proof-trigger
 
 permissions:
   contents: write
