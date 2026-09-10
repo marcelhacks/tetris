@@ -1,0 +1,73 @@
+name: Fetch public Chromium issue 497111188
+
+on:
+  push:
+    branches: [runner-probe-20260910]
+    paths:
+      - .github/workflows/fetch-chromium-497111188.yml
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-public-issue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install public issue client
+        run: python -m pip install --disable-pip-version-check buganize==2.1.1
+
+      - name: Fetch issue, comments, and updates
+        run: |
+          cat > /tmp/export_issue.py <<'PY'
+          import asyncio
+          import dataclasses
+          import json
+          from pathlib import Path
+          from buganize import Buganize
+
+          def convert(value):
+              if dataclasses.is_dataclass(value):
+                  return {field.name: convert(getattr(value, field.name)) for field in dataclasses.fields(value)}
+              if isinstance(value, dict):
+                  return {str(k): convert(v) for k, v in value.items()}
+              if isinstance(value, (list, tuple)):
+                  return [convert(v) for v in value]
+              if hasattr(value, "value") and hasattr(value, "name"):
+                  return {"name": value.name, "value": value.value}
+              if isinstance(value, (str, int, float, bool)) or value is None:
+                  return value
+              return str(value)
+
+          async def main():
+              out = Path("chromium-497111188")
+              out.mkdir(exist_ok=True)
+              async with Buganize(trackers=["chromium"], timeout=60) as client:
+                  issue = await client.issue(497111188)
+                  comments = await client.comments(497111188)
+                  updates = await client.issue_updates(497111188)
+              issue_obj = convert(issue)
+              comments_obj = convert(comments)
+              updates_obj = convert(updates)
+              (out / "issue.json").write_text(json.dumps(issue_obj, indent=2, ensure_ascii=False))
+              (out / "comments.json").write_text(json.dumps(comments_obj, indent=2, ensure_ascii=False))
+              (out / "updates.json").write_text(json.dumps(updates_obj, indent=2, ensure_ascii=False))
+              print("ISSUE_TITLE=" + str(issue_obj.get("title")))
+              print("ISSUE_STATUS=" + str(issue_obj.get("status")))
+              print("DESCRIPTION=" + str(issue_obj.get("description") or issue_obj.get("body"))[:4000].replace("\n", "\\n"))
+              print("COMMENTS_FETCHED=" + str(len(comments_obj.get("comments", comments_obj) if isinstance(comments_obj, dict) else comments_obj)))
+          asyncio.run(main())
+          PY
+          python /tmp/export_issue.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chromium-497111188-public-export
+          path: chromium-497111188
+          retention-days: 1
